@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+build_faiss_from_sheet_bq.py
+- 目的: Excel/CSV のクエリペア一覧から、raw の実行計画を特徴量化して FAISS に登録（RAG 参照用）。
+- 特徴:
+  * BigQuery の job 取得で --location を asia-northeast1 に固定（必須）
+  * job 取得に失敗した場合は EXPLAIN <raw_sql> で実行計画を取得（フォールバック）
+  * v2 特徴量（register_to_faiss_v2 と同じ 17 次元）で StandardScaler → L2 → IndexFlatIP (cosine)
+  * 既存 index/metadata があれば追記、無ければ新規作成
+- 必須アーティファクト（--artifacts-dir 配下）:
+  * scaler_v2.pkl
+  * feature_schema_v2.json
+  * （追記時）faiss_v2_cosine.index, metadata_v2.parquet
+"""
+
+import os
+import re
+import json
+import uuid
+import argparse
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import faiss
+import joblib
+from google.cloud import bigquery
+
+# ---------- 定数 ----------
+JOB_LOCATION = "asia-northeast1"  # 全体一律
+FAISS_INDEX_NAME = "faiss_v2_cosine.index"
+SCALER_NAME = "scaler_v2.pkl"
+METADATA_PARQUET = "metadata_v2.parquet"
+FEATURE_SCHEMA_NAME = "feature_schema_v2.json"
+
+# ---------- シート列名（エイリアス吸収） ----------
+ALIASES = {
+    "カテゴリ": ["カテゴリ", "category", "カテゴリ名", "COL_CAT"],
+    "rawクエリ": ["rawクエリ", "raw_query", "raw sql", "raw", "COL_RAW_SQL"],
+    "rawクエリの実行id": ["rawクエリの実行id", "raw_job_id", "raw実行id", "raw job id", "raw_job", "COL_RAW_JOB"],
+    "optimizedクエリ": ["optimizedクエリ", "optimized_query", "optimized sql", "optimized", "COL_OPT_SQL"],
+    "optimizedクエリの実行ID": ["optimizedクエリの実行ID", "opt_job_id", "optimized実行id", "optimized job id", "opt_job", "COL_OPT_JOB"],
+}
+
+# ---------- ユーティリティ ----------
+def pick_col(df: pd.DataFrame, logical_name: str) -> str:
+    want = [c.lower().strip() for c in ALIASES[logical_name]]
+    cols_lc = {c.lower().strip(): c for c in df.columns}
+    for a in want:
+        if a in cols_lc:
+            return cols_lc[a]
+    return None
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def safe_get(d: Dict[str, Any], path: List[str], default=0):
+    cur = d
+    for k in path:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return default
+    return cur
+
+def l2_normalize(a: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(a, axis=1, keepdims=True) + 1e-12
+    return a / n
+
+def load_feature_keys(artifacts_dir: str) -> List[str]:
+    p = os.path.join(artifacts_dir, FEATURE_SCHEMA_NAME)
+    with open(p, "r", encoding="utf-8") as f:
+        sch = json.load(f)
+    return sch.get("keys") or sch.get("feature_keys") or sch["keys"]
+
+# ---------- BigQuery 取得 ----------
+def fetch_job_properties(client: bigquery.Client, job_id: str) -> Dict[str, Any]:
+    """
+    BigQuery の QueryJob を location 指定で取得し、_properties を返す。
+    """
+    job = client.get_job(job_id, location=JOB_LOCATION)  # ← location を必須指定
+    # to_api_repr() でもよいが、_properties の方が plan 情報が十分に入ることが多い
+    return job._properties  # type: ignore
+
+def fetch_plan_via_explain(client: bigquery.Client, sql: str) -> Dict[str, Any]:
+    """
+    EXPLAIN <sql> を実行して explain_json を受け取り、statistics.query に擬似的に詰める。
+    """
+    q = "EXPLAIN\n" + sql
+    job = client.query(q, job_config=bigquery.QueryJobConfig(dry_run=False, use_query_cache=False), location=JOB_LOCATION)
+    rows = list(job.result())
+    if not rows:
+        raise RuntimeError("EXPLAIN returned no rows")
+    explain_json_str = rows[0].get("explain_json") if "explain_json" in rows[0] else rows[0][0]
+    explain = json.loads(explain_json_str)
+    return {
+        "statistics": {
+            "query": {
+                "text": sql,
+                "queryPlan": explain.get("queryPlan", []),
+                "totalBytesProcessed": explain.get("totalBytesProcessed", 0),
+                "totalSlotMs": explain.get("totalSlotMs", 0),
+            }
+        }
+    }
+
+def extract_sql_from_props(props: Dict[str, Any]) -> str:
+    return (
+        props.get("statistics", {}).get("query", {}).get("query", "")  # 古いフィールド名
+        or props.get("statistics", {}).get("query", {}).get("text", "")
+        or ""
+    )
+
+# ---------- v2 features ----------
+def summarize_plan_for_features(props: Dict[str, Any]) -> Dict[str, Any]:
+    q = props.get("statistics", {}).get("query", {}) or {}
+    stages = q.get("queryPlan", []) or []
+    n_stages = len(stages)
+
+    total_slot_ms = float(q.get("totalSlotMs", 0) or 0)
+    total_bytes_proc = float(q.get("totalBytesProcessed", 0) or 0)
+
+    stage_slot_ms: List[float] = []
+    bytes_read = 0.0
+    bytes_written = 0.0
+    rec_read = 0.0
+    rec_written = 0.0
+    n_joins = 0
+    n_sorts = 0
+    n_aggs = 0
+
+    for st in stages:
+        sm = float(st.get("slotMs", 0) or 0)
+        stage_slot_ms.append(sm)
+
+        display = (st.get("displayName") or "")
+        steps = st.get("steps", []) or []
+        steps_txt = []
+        for s in steps:
+            kind = s.get("kind", "")
+            subs = s.get("substeps", [])
+            if isinstance(subs, list) and subs:
+                steps_txt.append(kind + " " + " ".join(map(str, subs)))
+            else:
+                steps_txt.append(kind)
+        text = (display + " " + " ".join(steps_txt)).lower()
+        if "join" in text: n_joins += 1
+        if "sort" in text or "order" in text: n_sorts += 1
+        if "aggregate" in text or "group by" in text: n_aggs += 1
+
+        bytes_read     += float(safe_get(st, ["read", "bytesRead"], 0) or 0)
+        bytes_written  += float(safe_get(st, ["write", "bytesWritten"], 0) or 0)
+        rec_read       += float(safe_get(st, ["read", "recordsRead"], 0) or 0)
+        rec_written    += float(safe_get(st, ["write", "recordsWritten"], 0) or 0)
+
+    if not stage_slot_ms and total_slot_ms > 0:
+        stage_slot_ms = [total_slot_ms]
+    if bytes_read == 0 and total_bytes_proc > 0:
+        bytes_read = total_bytes_proc
+
+    avg_slot_ms = float(np.mean(stage_slot_ms)) if stage_slot_ms else 0.0
+    p95_slot_ms = float(np.percentile(stage_slot_ms, 95)) if stage_slot_ms else 0.0
+
+    return {
+        "n_stages": float(n_stages),
+        "n_joins": float(n_joins),
+        "n_sorts": float(n_sorts),
+        "n_aggregations": float(n_aggs),
+        "total_slot_ms": float(total_slot_ms),
+        "avg_slot_ms": float(avg_slot_ms),
+        "p95_slot_ms": float(p95_slot_ms),
+        "bytes_read_total": float(bytes_read),
+        "bytes_written_total": float(bytes_written),
+        "records_read_total": float(rec_read),
+        "records_written_total": float(rec_written),
+    }
+
+def basic_sql_stats(sql: str) -> Dict[str, Any]:
+    s = (sql or "").lower()
+    select_cols = s.count(",") + (1 if "select" in s else 0)
+    where_pred  = s.count(" where ")
+    group_by    = s.count(" group by ")
+    order_by    = s.count(" order by ")
+    joins       = s.count(" join ")
+    return {
+        "select_columns_count": float(max(select_cols, 0)),
+        "where_predicates_count": float(max(where_pred, 0)),
+        "groupby_cols": float(max(group_by, 0)),
+        "orderby_cols": float(max(order_by, 0)),
+        "sql_joins_count": float(max(joins, 0)),
+    }
+
+def build_features_v2(props: Dict[str, Any], raw_sql: str, schema_keys: List[str]) -> np.ndarray:
+    pj = summarize_plan_for_features(props)
+    sj = basic_sql_stats(raw_sql or "")
+
+    read_write_ratio = pj["bytes_read_total"] / (pj["bytes_written_total"] + 1.0)
+    heavy_ops_density = (
+        (pj["n_joins"] + pj["n_sorts"] + pj["n_aggregations"]) / pj["n_stages"]
+        if pj["n_stages"] > 0 else 0.0
+    )
+
+    feat_map = {
+        "n_stages": pj["n_stages"],
+        "n_joins": pj["n_joins"],
+        "n_sorts": pj["n_sorts"],
+        "n_aggregations": pj["n_aggregations"],
+        "avg_slot_ms": pj["avg_slot_ms"],
+        "p95_slot_ms": pj["p95_slot_ms"],
+        "bytes_read_total": pj["bytes_read_total"],
+        "bytes_written_total": pj["bytes_written_total"],
+        "records_read_total": pj["records_read_total"],
+        "records_written_total": pj["records_written_total"],
+        "read_write_ratio": float(read_write_ratio),
+        "heavy_ops_density": float(heavy_ops_density),
+        "select_columns_count": sj["select_columns_count"],
+        "where_predicates_count": sj["where_predicates_count"],
+        "groupby_cols": sj["groupby_cols"],
+        "orderby_cols": sj["orderby_cols"],
+        "sql_joins_count": sj["sql_joins_count"],
+    }
+
+    missing = [k for k in schema_keys if k not in feat_map]
+    if missing:
+        raise SystemExit(f"feature mismatch against schema: missing={missing}")
+
+    vec = np.array([[float(feat_map[k]) for k in schema_keys]], dtype=np.float32)
+    return vec
+
+# ---------- メタデータ・FAISS ----------
+def load_existing_index_meta(artifacts_dir: str):
+    idx_path = os.path.join(artifacts_dir, FAISS_INDEX_NAME)
+    meta_path = os.path.join(artifacts_dir, METADATA_PARQUET)
+    index = None
+    meta_df = None
+    if os.path.exists(idx_path) and os.path.exists(meta_path):
+        index = faiss.read_index(idx_path)
+        meta_df = pq.read_table(meta_path).to_pandas()
+    return index, meta_df
+
+def append_metadata(meta_path: str, df_append: pd.DataFrame):
+    if os.path.exists(meta_path):
+        base = pq.read_table(meta_path)
+        out = pa.Table.from_pandas(pd.concat([base.to_pandas(), df_append], ignore_index=True))
+    else:
+        out = pa.Table.from_pandas(df_append)
+    pq.write_table(out, meta_path)
+
+# ---------- メイン ----------
+def main():
+    ap = argparse.ArgumentParser(description="Build/append FAISS from sheet + BigQuery plans.")
+    ap.add_argument("--sheet", required=True, help="Path to Excel/CSV")
+    ap.add_argument("--sheet-name", default=None, help="Excel sheet name (if Excel)")
+    ap.add_argument("--artifacts-dir", required=True)
+    ap.add_argument("--plans-dir", default=None, help="Optional: dump fetched plans as JSON")
+    ap.add_argument("--project", required=True)
+    ap.add_argument("--append", action="store_true", help="Append to existing index/metadata if present")
+    args = ap.parse_args()
+
+    ensure_dir(args.artifacts_dir)
+    if args.plans_dir:
+        ensure_dir(args.plans_dir)
+
+    # 読み込み（Excel/CSV 自動判別）
+    if args.sheet.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(args.sheet, sheet_name=args.sheet_name)
+    else:
+        df = pd.read_csv(args.sheet)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 列名マッピング
+    COL_CAT     = pick_col(df, "カテゴリ")
+    COL_RAW_SQL = pick_col(df, "rawクエリ")
+    COL_RAW_JOB = pick_col(df, "rawクエリの実行id")
+    COL_OPT_SQL = pick_col(df, "optimizedクエリ")
+    COL_OPT_JOB = pick_col(df, "optimizedクエリの実行ID")
+
+    missing = []
+    if COL_RAW_JOB is None: missing.append("rawクエリの実行id（または同義列）")
+    if COL_OPT_SQL is None: missing.append("optimizedクエリ（または同義列）")
+    if missing:
+        raise SystemExit(f"ERROR: 必須列が見つかりません: {', '.join(missing)}\n列: {list(df.columns)}")
+
+    # アーティファクト
+    scaler = joblib.load(os.path.join(args.artifacts_dir, SCALER_NAME))
+    schema_keys = load_feature_keys(args.artifacts_dir)
+
+    # 既存 index/meta
+    index, meta_df_existing = load_existing_index_meta(args.artifacts_dir)
+    if index is None or not args.append:
+        # 新規作成
+        index = faiss.IndexFlatIP(len(schema_keys))
+        meta_df_existing = pd.DataFrame(columns=[
+            "id", "pair_id", "variant", "raw_job_id", "opt_job_id",
+            "raw_sql_text", "opt_sql_text", "category"
+        ])
+
+    client = bigquery.Client(project=args.project, location=JOB_LOCATION)
+
+    vecs = []
+    new_meta_rows = []
+
+    for i, r in df.iterrows():
+        raw_job_id = str(r.get(COL_RAW_JOB) or "").strip()
+        opt_sql = str(r.get(COL_OPT_SQL) or "").strip()
+        raw_sql_sheet = str(r.get(COL_RAW_SQL) or "").strip()
+        category = str(r.get(COL_CAT) or "").strip() if COL_CAT else ""
+        opt_job_id = str(r.get(COL_OPT_JOB) or "").strip() if COL_OPT_JOB else ""
+
+        if not raw_job_id or not opt_sql:
+            print(f"[WARN] row {i}: raw_job_id/optimizedクエリ 欠落 → スキップ")
+            continue
+
+        # 1) job から計画取得
+        props = None
+        try:
+            props = fetch_job_properties(client, raw_job_id)
+        except Exception as e:
+            print(f"[INFO] row {i}: job取得失敗（{raw_job_id}）→ EXPLAIN フォールバック: {e}")
+            if not raw_sql_sheet:
+                print(f"[WARN] row {i}: rawクエリが空のためフォールバック不可 → スキップ")
+                continue
+            try:
+                props = fetch_plan_via_explain(client, raw_sql_sheet)
+            except Exception as e2:
+                print(f"[WARN] row {i}: EXPLAIN 取得失敗 → スキップ ({e2})")
+                continue
+
+        # raw SQL（シート優先、なければ job 由来）
+        raw_sql = raw_sql_sheet or extract_sql_from_props(props)
+
+        # plan dump 保存（任意）
+        if args.plans_dir:
+            dump_path = os.path.join(args.plans_dir, f"plan_row{i}_{raw_job_id}.json")
+            with open(dump_path, "w", encoding="utf-8") as f:
+                json.dump(props, f, ensure_ascii=False, indent=2)
+
+        # 特徴量 → スケール → L2
+        q_vec = build_features_v2(props, raw_sql, schema_keys)
+        q_scaled = scaler.transform(q_vec)
+        q_unit = l2_normalize(q_scaled)
+        vecs.append(q_unit.astype(np.float32))
+
+        # メタ行（raw のみ、optimized は参照として同じペアに紐づけ）
+        pair_id = str(uuid.uuid4())
+        new_meta_rows.append({
+            "id": f"{args.project}:{raw_job_id}",
+            "pair_id": pair_id,
+            "variant": "raw",
+            "raw_job_id": raw_job_id,
+            "opt_job_id": opt_job_id,
+            "raw_sql_text": raw_sql,
+            "opt_sql_text": opt_sql,
+            "category": category
+        })
+        # 参照用に optimized 行も格納（検索には使わない）
+        new_meta_rows.append({
+            "id": f"{args.project}:{raw_job_id}:opt",
+            "pair_id": pair_id,
+            "variant": "optimized",
+            "raw_job_id": raw_job_id,
+            "opt_job_id": opt_job_id,
+            "raw_sql_text": raw_sql,
+            "opt_sql_text": opt_sql,
+            "category": category
+        })
+
+    if not vecs:
+        raise SystemExit("[ERROR] 登録対象が0件でした。job_id と optimizedクエリ列、プロジェクト/ロケーションをご確認ください。")
+
+    X = np.vstack(vecs)  # 検索対象は raw のみ（optimized 行はメタのみ）
+    index.add(X)
+
+    # 保存
+    faiss.write_index(index, os.path.join(args.artifacts_dir, FAISS_INDEX_NAME))
+
+    meta_out = pd.concat([meta_df_existing, pd.DataFrame(new_meta_rows)], ignore_index=True)
+    append_metadata(os.path.join(args.artifacts_dir, METADATA_PARQUET), meta_out.iloc[len(meta_df_existing):])
+
+    print(f"[OK] Added {X.shape[0]} vectors.")
+    print(f"[OK] Index -> {os.path.join(args.artifacts_dir, FAISS_INDEX_NAME)}")
+    print(f"[OK] Metadata appended -> {os.path.join(args.artifacts_dir, METADATA_PARQUET)}")
+
+if __name__ == "__main__":
+    main()
