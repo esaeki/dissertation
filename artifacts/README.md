@@ -1,6 +1,7 @@
-■ Reproducing the Results
+# Reproducing Experimental Results (RAG SQL Rewriting on BigQuery)
 
-This repository provides the implementation and experiment pipeline for evaluating RAG-based SQL query rewriting on Google BigQuery.
+This README explains how to reproduce the experimental results (per-query and parameter-wise tables) used in the dissertation, including FAISS setup, rewriting, evaluation, and aggregation. \
+This repository provides the implementation and experiment pipeline for evaluating RAG-based SQL query rewriting on Google BigQuery. \
 It reproduces two key result tables in the dissertation:
 
     1. Per-query performance table (equivalence and slot reduction per query)
@@ -19,8 +20,8 @@ bq_cost_eval.py is required for both summary tables. \
 summarize_bq_eval.py → query-level summary \
 aggregate_results.py → parameter-level summary
 
-0. Preparation \
-Step 1: Register FAISS Index (29 Query Pairs)
+## 0. Preparation \
+### Step 1: Register FAISS Index (29 Query Pairs)
 
 ```bash
 python3 build_faiss_from_sheet_bq.py \
@@ -32,7 +33,7 @@ python3 build_faiss_from_sheet_bq.py \
   --append
 ```
 
-Step 2: Retrieve Example Query Plans (Optional)
+### Step 2: Retrieve Example Query Plans (Optional)
 
 ```bash
 python3 sql2planjson.py --sql ~/queries_example/q3/orig.sql  --out /tmp/q3_plan.json
@@ -42,7 +43,7 @@ python3 sql2planjson.py --sql ~/queries_example/q9/orig.sql  --out /tmp/q9_plan.
 python3 sql2planjson.py --sql ~/queries_example/q21/orig.sql --out /tmp/q21_plan.json
 ```
 
-Step 3: Generate Rewritten Queries (RAG / Zero-shot)
+### Step 3: Generate Rewritten Queries (RAG / Zero-shot)
 
 ```bash
 python3 ~/run_rewrite_batch.py \
@@ -54,7 +55,7 @@ python3 ~/run_rewrite_batch.py \
   --min_similarity  0.10
 ```
 
-1. Run the Evaluation (Raw Data Collection)
+## 1. Run the Evaluation (Raw Data Collection)
 
 Each experiment runs all query variants on BigQuery multiple times (e.g., 5 runs). \
 It collects total slot time, bytes processed, and checks equivalence between variants.
@@ -94,7 +95,7 @@ python3 /home/hff1231/bq_cost_eval.py \
 Output: /tmp/bq_eval_results_topk5_sim010_runs5.csv \
 This file serves as the base input for the next summarization scripts.
 
-2. Generate the Per-Query Summary Table
+## 2. Generate the Per-Query Summary Table
 
 This step produces the table showing each query’s equivalence and slot reduction.
 (Used for Section 5.4 of the dissertation.)
@@ -113,7 +114,7 @@ Output columns:
 - Slot reduction (orig → rag, zero → rag)
 - Relative comparison (RAG better, Zero better, Tie)
 
-3. Generate the Condition-wise Aggregated Table
+## 3. Generate the Condition-wise Aggregated Table
 
 After running multiple conditions (topk, min_similarity), aggregate them:
 
@@ -141,7 +142,7 @@ Columns include:
 
 Used for Section 5.5 “Parameter Sensitivity” in the dissertation.
 
-4. Common Issues & Tips
+## 4. Common Issues & Tips
 
 | Issue                       | Cause / Fix                                                                 |
 | --------------------------- | --------------------------------------------------------------------------- |
@@ -150,7 +151,7 @@ Used for Section 5.5 “Parameter Sensitivity” in the dissertation.
 | **Noisy slot time results** | Increase `--runs` to 3-5 and compute medians.                               |
 | **BigQuery caching**        | Ensure cache is disabled (each run executes fresh).                         |
 
-5. Mapping to Dissertation Tables
+#  5. Mapping to Dissertation Tables
 
 | Issue                       | Cause / Fix                                                                 |
 | --------------------------- | --------------------------------------------------------------------------- |
