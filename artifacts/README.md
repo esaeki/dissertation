@@ -20,7 +20,7 @@ bq_cost_eval.py is required for both summary tables. \
 summarize_bq_eval.py → query-level summary \
 aggregate_results.py → parameter-level summary
 
-## 0. Preparation \
+## 0. Preparation
 ### Step 1: Register FAISS Index (29 Query Pairs)
 
 ```bash
@@ -151,7 +151,7 @@ Used for Section 5.5 “Parameter Sensitivity” in the dissertation.
 | **Noisy slot time results** | Increase `--runs` to 3-5 and compute medians.                               |
 | **BigQuery caching**        | Ensure cache is disabled (each run executes fresh).                         |
 
-#  5. Mapping to Dissertation Tables
+## 5. Mapping to Dissertation Tables
 
 | Issue                       | Cause / Fix                                                                 |
 | --------------------------- | --------------------------------------------------------------------------- |
