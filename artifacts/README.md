@@ -14,12 +14,12 @@ It reproduces two key result tables in the dissertation:
 | **`summarize_bq_eval.py`** | One CSV file from above                         | `bq_eval_summary.md` / `bq_eval_summary.csv`           | Generates the **per-query result table**                                                      |
 | **`aggregate_results.py`** | Multiple CSVs from different parameter settings | `summary_by_condition.csv` / `summary_by_condition.md` | Produces the **parameter-level summary table** (e.g., `topk` × `min_similarity`)              |
 
-Note:
+Note: \
 bq_cost_eval.py is required for both summary tables. \
 summarize_bq_eval.py → query-level summary \
-aggregate_results.py → parameter-level summary \
+aggregate_results.py → parameter-level summary
 
-0. Preparation
+0. Preparation \
 Step 1: Register FAISS Index (29 Query Pairs)
 
 ```bash
@@ -94,7 +94,7 @@ python3 /home/hff1231/bq_cost_eval.py \
 Output: /tmp/bq_eval_results_topk5_sim010_runs5.csv \
 This file serves as the base input for the next summarization scripts.
 
-2️. Generate the Per-Query Summary Table
+2. Generate the Per-Query Summary Table
 
 This step produces the table showing each query’s equivalence and slot reduction.
 (Used for Section 5.4 of the dissertation.)
@@ -141,7 +141,7 @@ Columns include:
 
 Used for Section 5.5 “Parameter Sensitivity” in the dissertation.
 
-4️. Common Issues & Tips
+4. Common Issues & Tips
 
 | Issue                       | Cause / Fix                                                                 |
 | --------------------------- | --------------------------------------------------------------------------- |
