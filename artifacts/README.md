@@ -15,9 +15,9 @@ It reproduces two key result tables in the dissertation:
 | **`aggregate_results.py`** | Multiple CSVs from different parameter settings | `summary_by_condition.csv` / `summary_by_condition.md` | Produces the **parameter-level summary table** (e.g., `topk` × `min_similarity`)              |
 
 Note:
-bq_cost_eval.py is required for both summary tables.
-summarize_bq_eval.py → query-level summary
-aggregate_results.py → parameter-level summary
+bq_cost_eval.py is required for both summary tables. \
+summarize_bq_eval.py → query-level summary \
+aggregate_results.py → parameter-level summary \
 
 0. Preparation
 Step 1: Register FAISS Index (29 Query Pairs)
@@ -56,7 +56,7 @@ python3 ~/run_rewrite_batch.py \
 
 1. Run the Evaluation (Raw Data Collection)
 
-Each experiment runs all query variants on BigQuery multiple times (e.g., 5 runs).
+Each experiment runs all query variants on BigQuery multiple times (e.g., 5 runs). \
 It collects total slot time, bytes processed, and checks equivalence between variants.
 
 ```bash
@@ -91,7 +91,7 @@ python3 /home/hff1231/bq_cost_eval.py \
   --tolerance 1e-9
 ```
 
-Output: /tmp/bq_eval_results_topk5_sim010_runs5.csv
+Output: /tmp/bq_eval_results_topk5_sim010_runs5.csv \
 This file serves as the base input for the next summarization scripts.
 
 2️. Generate the Per-Query Summary Table
