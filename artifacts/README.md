@@ -98,7 +98,6 @@ This file serves as the base input for the next summarization scripts.
 ## 2. Generate the Per-Query Summary Table
 
 This step produces the table showing each query’s equivalence and slot reduction.
-(Used for Section 5.4 of the dissertation.)
 
 ```bash
 python3 summarize_bq_eval.py \
@@ -139,8 +138,6 @@ Columns include:
 - rag_best, zero_best, orig_best (count of fastest variants)
 - equiv_rate_rag, equiv_rate_zero (equivalence ratio)
 - median Δ(orig→rag), median Δ(zero→rag) (median slot difference)
-
-Used for Section 5.5 “Parameter Sensitivity” in the dissertation.
 
 ## 4. Common Issues & Tips
 
