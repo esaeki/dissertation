@@ -36,7 +36,6 @@ def write_text(p, s):
         f.write(s)
 
 def run_sql2plan(sql_path: str, out_json: str):
-    # sql2planjson.py は同ディレクトリや絶対パスに置いてください
     helper = "sql2planjson.py"
     if not os.path.isabs(helper):
         helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sql2planjson.py")

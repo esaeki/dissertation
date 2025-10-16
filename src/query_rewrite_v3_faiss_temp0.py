@@ -3,8 +3,8 @@
 """
 query_rewrite_v3_faiss_temp0.py
 --------------------------------
-patch4 をベースに、デフォルトの LLM 温度を **0.0**（決定論）に固定した版。
-必要に応じて --temperature で上書き可能。その他の仕様は patch4 と同じです。
+Fix the default LLM temperature at **0.0** (deterministic).
+You can override it with --temperature if needed.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def _read_json(path: str) -> Optional[Dict[str, Any]]:
 def extract_sql_from_plan_json(plan_path: str, debug: bool=False) -> Optional[str]:
     obj = _read_json(plan_path)
     if obj is None:
-        print(f"[ERROR] plan JSON read failed: {plan_path}", file=sys.stderr)
+        print(f"[ERROR] failed to read plan JSON: {plan_path}", file=sys.stderr)
         return None
 
     candidates = [
@@ -341,27 +341,27 @@ def retrieve_neighbors_with_faiss(
 
 # ===== Prompt construction =====
 
-PROMPT_HEADER = """あなたはSQLパフォーマンス最適化の熟練レビュアです。
-ここでは「参照例の適用」を厳守し、与えられた参照例（raw→optimized）の変換パターンを、入力SQLに**転写**します。
-自由な発明や憶測はせず、参照例と構造的に対応する変換のみを行ってください。"""
+PROMPT_HEADER = """You are a seasoned reviewer of SQL performance optimization.
+In this task, strictly follow the principle of "applying reference examples" and **transpose** the transformation patterns from the given reference examples (raw→optimized) onto the input SQL.
+Do not invent freely or speculate; only perform transformations that structurally correspond to the reference examples."""
 
 PROMPT_RULES = """
-【厳格ルール】
-1) 意味保持: 元クエリの意味・結果集合・集計粒度を変えない。
-2) 参照例の転写: 参照例で行われた具体的変換に**一致**する変換のみ行う。
-3) 一般化の許容: 列や型が異なっても**論理構造が同一**なら適用可能とする。
-   例: (a) OR による範囲条件 → (NOT) BETWEEN への正規化、
-       (b) 集計関数の等価展開（AVG(x) ≒ SAFE_DIVIDE(SUM(x), COUNT(x))）、
-       (c) ORDER BY で集計別名の再利用 など。
-4) 禁止: スキーマに存在しないオブジェクト、JOINの追加/削除、集計キー変更、新規関数/ヒント導入、整形用 LIMIT、
-         無意味なサブクエリの導入や不要なネスト（見た目だけの変更）。
-5) 書式: BigQuery 標準SQL。エイリアス/インデント整形。
-6) 出力形式: 次の JSON のみを返す。
-   {{
+[Strict Rules]
+1) Semantic preservation: Do not change the original query's meaning, result set, or aggregation granularity.
+2) Transcribe from reference: Only apply transformations that **match** what the reference examples actually did.
+3) Allow limited generalization: Even if columns or types differ, you may apply a pattern when the **logical structure is the same**.
+   Examples: (a) range using OR → normalize to (NOT) BETWEEN,
+             (b) equivalent expansion of aggregate functions (AVG(x) ≒ SAFE_DIVIDE(SUM(x), COUNT(x))),
+             (c) reuse SELECT aliases in ORDER BY to avoid recomputation.
+4) Prohibited: introducing objects not in the schema; adding/removing JOINs; changing grouping keys; introducing new functions/hints; cosmetic LIMIT;
+               meaningless subqueries or unnecessary nesting (cosmetic-only changes).
+5) Formatting: BigQuery Standard SQL. Use aliases and indentation.
+6) Output format: return **only** the following JSON.
+   {
      "optimized_sql": "...",
-     "rationale": "どの参照例のどの変換をどこに当てたか。該当なしの場合はその旨を明記。"
-   }}
-7) 適用方針: 上記パターンが**適用可能な場合にのみ**変更する。該当しなければ**変更しない**（無理に変更を捻出しない）。
+     "rationale": "Which transformation(s) from which reference(s) were applied where. If none matched, state that explicitly."
+   }
+7) Application policy: Apply changes **only when** the above patterns are applicable. If none match, **make no changes** (do not force changes).
 """
 
 def make_pattern_hints(input_sql: str) -> str:
@@ -371,7 +371,7 @@ def make_pattern_hints(input_sql: str) -> str:
     m = re.search(r"(\b[a-z_][a-z0-9_]*\b)\s*<\s*([0-9.]+)\s*or\s*\1\s*>\s*([0-9.]+)", s)
     if m:
         col, a, b = m.group(1), m.group(2), m.group(3)
-        hints.append(f"- 検知: {col} < {a} OR {col} > {b} → {col} NOT BETWEEN {a} AND {b} に正規化可能")
+        hints.append(f"- Detected: {col} < {a} OR {col} > {b} → could normalize to {col} NOT BETWEEN {a} AND {b}")
 
     if "order by" in s and "sum(" in s:
         alias_m = re.findall(r"sum\s*\(\s*([a-z0-9_\.]+)\s*\)\s+as\s+([a-z0-9_]+)", s)
@@ -380,14 +380,14 @@ def make_pattern_hints(input_sql: str) -> str:
             sum_cols_in_select = {c for (c, a) in alias_m}
             for (c, _dir) in order_m:
                 if c in sum_cols_in_select:
-                    hints.append("- 検知: ORDER BY の集計式は SELECT 別名で再利用可能（再計算回避）")
+                    hints.append("- Detected: ORDER BY aggregate expression can reuse the SELECT alias (avoid recomputation)")
                     break
 
     return "\n".join(hints) if hints else ""
 
 
 def build_prompt(input_sql: str, ref_neighbors: List[Dict[str, Any]], mode: str) -> str:
-    mode_note = "（ゼロショット: 参照例なし）" if mode == "zero" else "（RAG: 参照例あり）"
+    mode_note = "(zero-shot: no references)" if mode == "zero" else "(RAG: with references)"
 
     examples_block = []
     for i, nb in enumerate(ref_neighbors, 1):
@@ -395,7 +395,7 @@ def build_prompt(input_sql: str, ref_neighbors: List[Dict[str, Any]], mode: str)
         features_str = ", ".join(f"{k}={v}" for k, v in f.items()) if f else "n/a"
         note = f"\n# notes: {nb.get('notes')}" if nb.get("notes") else ""
         examples_block.append(
-            f"""### 参照例 {i}
+            f"""### Reference {i}
 # features: {features_str}{note}
 # raw:
 {nb.get('raw_sql','')}
@@ -405,22 +405,22 @@ def build_prompt(input_sql: str, ref_neighbors: List[Dict[str, Any]], mode: str)
 """
         )
     examples_text = "\n".join(examples_block)
-    ref_section = f"\n【参照例（raw → optimized）】\n{examples_text}\n" if ref_neighbors else "\n【参照例】（なし）\n"
+    ref_section = f"\n[References (raw → optimized)]\n{examples_text}\n" if ref_neighbors else "\n[References] (none)\n"
 
     hints = make_pattern_hints(input_sql)
-    hint_block = f"\n【入力に対する適用候補ヒント】\n{hints}\n" if hints else ""
+    hint_block = f"\n[Candidate hints for the input]\n{hints}\n" if hints else ""
 
     prompt = f"""{PROMPT_HEADER} {mode_note}
 
 {PROMPT_RULES}
 {hint_block}{ref_section}
-【入力SQL】
+[Input SQL]
 {input_sql}
 
-【タスク】
-- 上の参照例の変換パターンに一致し、かつ論理同型と判断できる範囲のみ最適化してください。
-- 参照例に存在しない種類の変換は行わないでください。
-- 出力は JSON だけ返してください。
+[Task]
+- Optimize **only** within the scope where the reference patterns match and the structure is logically isomorphic.
+- Do **not** perform transformations that do not exist in the reference examples.
+- Return JSON **only**.
 """
     return prompt
 
@@ -429,11 +429,11 @@ def call_llm(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.0, 
     try:
         import openai  # type: ignore
     except Exception:
-        print("[WARN] openai パッケージが見つかりません。--dry-run を使ってください。", file=sys.stderr)
+        print("[WARN] openai package not found. Use --dry-run to inspect the prompt.", file=sys.stderr)
         return ""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print("[WARN] OPENAI_API_KEY 未設定。--dry-run を使ってください。", file=sys.stderr)
+        print("[WARN] OPENAI_API_KEY is not set. Use --dry-run to inspect the prompt.", file=sys.stderr)
         return ""
     openai.api_key = api_key
     try:
@@ -448,11 +448,11 @@ def call_llm(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.0, 
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        print(f"[ERROR] LLM 呼び出し失敗: {e}", file=sys.stderr)
+        print(f"[ERROR] LLM call failed: {e}", file=sys.stderr)
         return ""
 
 
-# ===== 事後ガード（該当時のみ発火） =====
+# ===== Post-guards (fire only when applicable) =====
 def normalize_or_to_not_between(sql: str):
     def repl(m: re.Match) -> str:
         col, a, b = m.group(1), m.group(2), m.group(3)
@@ -497,14 +497,14 @@ def apply_safe_fallbacks(input_sql: str, llm_json: Dict[str, Any]) -> Dict[str, 
     if changed_any:
         add = []
         if ch1:
-            add.append("OR範囲外条件を NOT BETWEEN に正規化（等価）")
+            add.append("Normalized OR-range condition to NOT BETWEEN (equivalent)")
         if ch2:
-            add.append("ORDER BY の集計式を SELECT 別名で再利用")
+            add.append("Reused SELECT alias in ORDER BY instead of aggregate recomputation")
         rat2 = (rat + " / " if rat else "") + "；".join(add)
         return {"optimized_sql": opt3, "rationale": rat2}
 
     if not rat:
-        rat = "参照例/一般化パターンに適用可能な候補が見つからなかったため、変更なし。"
+        rat = "No applicable patterns found from references/generalization; left unchanged."
     return {"optimized_sql": opt, "rationale": rat}
 
 
@@ -517,7 +517,7 @@ def main():
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--min_similarity", type=float, default=0.10)
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
-    parser.add_argument("--temperature", type=float, default=0.0)  # ★ デフォルト 0.0
+    parser.add_argument("--temperature", type=float, default=0.0)  # ★ default 0.0
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
 
@@ -525,7 +525,7 @@ def main():
 
     input_sql = extract_sql_from_plan_json(args.plan_path, debug=args.debug)
     if not input_sql:
-        print("[ERROR] 入力SQLを --plan_path から抽出できませんでした。", file=sys.stderr)
+        print("[ERROR] could not extract input SQL from --plan_path.", file=sys.stderr)
         sys.exit(2)
 
     ranked = []
@@ -546,10 +546,10 @@ def main():
 
         if not neighbors_all:
             if args.debug:
-                print("[DEBUG] neighbors=0 → RAGだが参照例なし。ゼロショット相当で続行します。")
+                print("[DEBUG] neighbors=0 → RAG selected but no references available; proceed as zero-shot.")
             ranked = []
         else:
-            # n_joins==0 を優先し、tie は similarity 降順
+            # prioritize n_joins == 0; tie-break by similarity (descending)
             def sort_key(nb):
                 f = nb.get("features", {})
                 return (f.get("n_joins", 99), -float(f.get("similarity", 0.0)))
@@ -562,7 +562,7 @@ def main():
                     print(f"[{i}] id={nb.get('id')} features={json.dumps(nb.get('features', {}), ensure_ascii=False)}")
     else:
         if args.debug:
-            print("[DEBUG] ZERO mode: 参照例を使用しません。")
+            print("[DEBUG] ZERO mode: no references will be used.")
 
     prompt = build_prompt(input_sql=input_sql, ref_neighbors=ranked, mode=args.mode)
 
@@ -574,7 +574,7 @@ def main():
 
     llm_text = call_llm(prompt, model=args.model, temperature=args.temperature)
     if not llm_text:
-        print("[ERROR] LLM 応答が空です。API設定を確認するか --dry-run でプロンプトを確認してください。", file=sys.stderr)
+        print("[ERROR] empty LLM response. Check API settings or use --dry-run to inspect the prompt.", file=sys.stderr)
         sys.exit(2)
 
     text = llm_text.strip()
@@ -584,7 +584,7 @@ def main():
     try:
         payload = json.loads(text)
     except Exception:
-        print("[WARN] LLM応答はJSONとしてparseできません。rawを出力します。\n")
+        print("[WARN] LLM response could not be parsed as JSON. Printing raw text below.\n")
         print(llm_text)
         sys.exit(0)
 

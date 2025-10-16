@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-bq_cost_eval.py  (RAG / Zero 等価性 + 近似集合比較 + N回実行メディアン)
+bq_cost_eval.py  (RAG / Zero equivalence + approximate set comparison + N-run median)
 
-- BigQuery で orig / zero / rag の3種を実行（キャッシュ無効）
-- 実行メトリクス（slot_millis / total_bytes_processed）を N回（--runs）計測しメディアン採用
-- 等価性:
-  - ordered=true  : 指定 order_by で BigQuery 側に整列させ、行ごとに近似比較（±tol）
-  - ordered=false : 近似集合等価（±tol, 重複まで一致）で判定
-- CSV 出力: 各バリアントのメディアン + 差分 + 等価性を保存
+- Execute three variants on BigQuery: orig / zero / rag (cache disabled)
+- Measure execution metrics (slot_millis / total_bytes_processed) N times (--runs) and take the median
+- Equivalence:
+  - ordered=true  : Let BigQuery sort with the specified order_by and compare rowwise approximately (±tol)
+  - ordered=false : Judge by approximate multiset equality (±tol, including duplicates)
+- CSV output: save each variant's median + deltas + equivalence flags
 """
 
 from __future__ import annotations
@@ -24,18 +24,18 @@ from typing import Any, Dict, List, Tuple
 from google.cloud import bigquery
 
 # ----------------------------
-# ユーティリティ
+# Utilities
 # ----------------------------
 
 def read_sql(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         sql = f.read()
-    # 末尾セミコロンは除去
+    # Remove trailing semicolon
     return re.sub(r";\s*$", "", sql.strip(), flags=re.S)
 
 def bq_run_query(client: bigquery.Client, sql: str, location: str, job_label: str) -> Tuple[List[bigquery.table.Row], Dict[str, Any]]:
     job_config = bigquery.QueryJobConfig(
-        use_query_cache=False,  # ★ キャッシュ無効
+        use_query_cache=False,  # ★ Disable cache
         labels={"eval": "cost", "run": job_label.replace("/", "_")[:60]}
     )
     job = client.query(sql, job_config=job_config, location=location)
@@ -48,9 +48,9 @@ def bq_run_query(client: bigquery.Client, sql: str, location: str, job_label: st
 
 def run_variant_many(client, sql, location, label, runs: int) -> Tuple[List[bigquery.table.Row], List[int], List[int]]:
     """
-    同一SQLを runs 回実行。
-    - rows は 1回目の行（等価性検証に使用）
-    - slot_millis_list / bytes_list は各回の数値（None→0 に丸め）
+    Execute the same SQL 'runs' times.
+    - rows: rows from the 1st run (used for equivalence checks)
+    - slot_millis_list / bytes_list: per-run metrics (None → 0)
     """
     rows_first: List[bigquery.table.Row] = []
     slot_list: List[int] = []
@@ -63,7 +63,7 @@ def run_variant_many(client, sql, location, label, runs: int) -> Tuple[List[bigq
         byte_list.append(0 if met["total_bytes_processed"] is None else int(met["total_bytes_processed"]))
     return rows_first, slot_list, byte_list
 
-# ===== 近似比較（集合用） =====
+# ===== Approximate comparison (set/multiset) =====
 
 def digits_from_tol(tol: float) -> int:
     if tol <= 0:
@@ -71,13 +71,13 @@ def digits_from_tol(tol: float) -> int:
     return max(0, int(round(-math.log10(tol))))
 
 def normalize_cell_approx(v: Any, tol: float) -> Tuple[str, Any]:
-    """数値は丸め、配列/辞書は整形、その他はそのまま。"""
+    """Numbers are rounded; arrays/dicts are serialized; others are left as-is."""
     if v is None:
         return ("__NONE__", None)
-    # list/dict は文字列化（順序/キー安定化）
+    # Serialize list/dict (stabilize order/keys)
     if isinstance(v, (list, dict)):
         return ("__JSON__", json.dumps(v, sort_keys=True, ensure_ascii=False))
-    # 数値近似
+    # Approximate numeric
     try:
         x = float(v)
         d = digits_from_tol(tol)
@@ -89,13 +89,13 @@ def normalize_row_approx(row: bigquery.table.Row, tol: float) -> Tuple:
     return tuple(normalize_cell_approx(v, tol) for v in row.values())
 
 def are_sets_equal_approx(rows_a: List[bigquery.table.Row], rows_b: List[bigquery.table.Row], tol: float = 1e-9) -> bool:
-    """順序無視 + 重複カウント + 近似比較"""
+    """Order-insensitive + duplicate counting + approximate comparison."""
     from collections import Counter
     ca = Counter(normalize_row_approx(r, tol) for r in rows_a)
     cb = Counter(normalize_row_approx(r, tol) for r in rows_b)
     return ca == cb
 
-# ===== 近似比較（順序行ごと） =====
+# ===== Approximate comparison (rowwise with order) =====
 
 def approx_equal(a: Any, b: Any, tol: float = 1e-9) -> bool:
     try:
@@ -125,7 +125,7 @@ def fetch_ordered_rows(client: bigquery.Client, base_sql: str, order_by: str, lo
     return rows
 
 # ----------------------------
-# 1クエリセットの評価
+# Evaluate one query set
 # ----------------------------
 
 def eval_query_set(
@@ -145,12 +145,12 @@ def eval_query_set(
 
     print(f"\n== {name} ({qid}) ==")
 
-    # N回実行（rows は 1回目のもの）
+    # Execute N times (rows are from the 1st run)
     rows_o, slots_o, bytes_o = run_variant_many(client, sql_orig, location_default, f"{qid}_orig", runs)
     rows_z, slots_z, bytes_z = run_variant_many(client, sql_zero, location_default, f"{qid}_zero", runs)
     rows_r, slots_r, bytes_r = run_variant_many(client, sql_rag,  location_default, f"{qid}_rag",  runs)
 
-    # 等価性：ordered は BigQuery 側で ORDER 付け直して1回取り直し
+    # Equivalence: when ordered, re-fetch once with ORDER BY on BigQuery side
     if ordered and order_by:
         rows_o_ord = fetch_ordered_rows(client, sql_orig, order_by, location_default, f"{qid}_orig")
         rows_z_ord = fetch_ordered_rows(client, sql_zero, order_by, location_default, f"{qid}_zero")
@@ -162,7 +162,7 @@ def eval_query_set(
         equiv_orig_vs_rag  = are_sets_equal_approx(rows_o, rows_r, tol=tol)
         equiv_orig_vs_zero = are_sets_equal_approx(rows_o, rows_z, tol=tol)
 
-    # メディアン
+    # Medians
     slot_o_med = int(median(slots_o))
     slot_z_med = int(median(slots_z))
     slot_r_med = int(median(slots_r))
@@ -170,19 +170,28 @@ def eval_query_set(
     byt_z_med  = int(median(bytes_z))
     byt_r_med  = int(median(bytes_r))
 
-    # 差分（メディアン同士）
+    # Deltas (median vs median)
     d_slot_o2r = slot_o_med - slot_r_med
-    d_slot_z2r = slot_z_med - slot_r_med
+    d_slot_o2z = slot_o_med - slot_z_med
     d_bytes_o2r = byt_o_med - byt_r_med
-    d_bytes_z2r = byt_z_med - byt_r_med
+    d_bytes_o2z = byt_o_med - byt_z_med
 
-    # 画面表示
+    # Console output (more explicit)
+    def _fmt(n: int) -> str:
+        return f"{n:,}"
+
     print(f"Equivalence (orig vs rag) : {'OK' if equiv_orig_vs_rag else 'MISMATCH'}")
     print(f"Equivalence (orig vs zero): {'OK' if equiv_orig_vs_zero else 'MISMATCH'}")
-    print(f"Slot reduction (orig→rag): {d_slot_o2r} ms   [medians over {runs} runs]")
-    print(f"Slot reduction (zero→rag): {d_slot_z2r} ms   [medians over {runs} runs]")
-    print(f"Bytes reduction (orig→rag): {d_bytes_o2r}")
-    print(f"Bytes reduction (zero→rag): {d_bytes_z2r}")
+
+    print(f"\nMedians over {runs} runs")
+    print(f"  Slot [ms] : orig={_fmt(slot_o_med)}, zero={_fmt(slot_z_med)}, rag={_fmt(slot_r_med)}")
+    print(f"  Bytes     : orig={_fmt(byt_o_med)},  zero={_fmt(byt_z_med)},  rag={_fmt(byt_r_med)}")
+
+    print("\nReductions (median vs median)")
+    print(f"  Slot  Δ (orig→rag):  {_fmt(d_slot_o2r)} ms")
+    print(f"  Slot  Δ (orig→zero): {_fmt(d_slot_o2z)} ms")
+    print(f"  Bytes Δ (orig→rag):  {_fmt(d_bytes_o2r)}")
+    print(f"  Bytes Δ (orig→zero): {_fmt(d_bytes_o2z)}")
 
     return {
         "qid": qid,
@@ -200,13 +209,13 @@ def eval_query_set(
         "bytes_zero_median": byt_z_med,
         "bytes_rag_median":  byt_r_med,
         "delta_slot_orig_to_rag_median": d_slot_o2r,
-        "delta_slot_zero_to_rag_median": d_slot_z2r,
         "delta_bytes_orig_to_rag_median": d_bytes_o2r,
-        "delta_bytes_zero_to_rag_median": d_bytes_z2r,
+        "delta_slot_orig_to_zero_median": d_slot_o2z,
+        "delta_bytes_orig_to_zero_median": d_bytes_o2z,
     }
 
 # ----------------------------
-# メイン
+# Main
 # ----------------------------
 
 def main():
@@ -253,8 +262,8 @@ def main():
         "equiv_orig_vs_rag","equiv_orig_vs_zero",
         "slot_ms_orig_median","slot_ms_zero_median","slot_ms_rag_median",
         "bytes_orig_median","bytes_zero_median","bytes_rag_median",
-        "delta_slot_orig_to_rag_median","delta_slot_zero_to_rag_median",
-        "delta_bytes_orig_to_rag_median","delta_bytes_zero_to_rag_median",
+        "delta_slot_orig_to_rag_median","delta_bytes_orig_to_rag_median",
+        "delta_slot_orig_to_zero_median","delta_bytes_orig_to_zero_median",
     ]
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", newline="", encoding="utf-8") as wf:
