@@ -42,7 +42,7 @@ python3 ~/run_rewrite_batch.py \
   --min_similarity  0.10
 ```
 
-## 1. Run the Evaluation (Raw Data Collection)
+### Step 4: Run the Evaluation
 
 Each experiment runs all query variants on BigQuery multiple times (e.g., 5 runs). \
 It collects total slot time, bytes processed, and checks equivalence between variants.
