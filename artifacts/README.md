@@ -7,19 +7,6 @@ It reproduces two key result tables in the dissertation:
     1. Per-query performance table (equivalence and slot reduction per query)
     2. Condition-wise performance table (aggregated by topk and min_similarity)
 
-■ Files and Their Roles
-
-| Script                     | Input                                           | Output                                                 | Purpose                                                                                       |
-| -------------------------- | ----------------------------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
-| **`bq_cost_eval.py`**      | Experiment config (`experiment_config.json`)    | Raw execution logs (`bq_eval_results_*.csv`)           | Runs all queries (orig / zero / rag) on BigQuery, collects slot time and verifies equivalence |
-| **`summarize_bq_eval.py`** | One CSV file from above                         | `bq_eval_summary.md` / `bq_eval_summary.csv`           | Generates the **per-query result table**                                                      |
-| **`aggregate_results.py`** | Multiple CSVs from different parameter settings | `summary_by_condition.csv` / `summary_by_condition.md` | Produces the **parameter-level summary table** (e.g., `topk` × `min_similarity`)              |
-
-Note: \
-bq_cost_eval.py is required for both summary tables. \
-summarize_bq_eval.py → query-level summary \
-aggregate_results.py → parameter-level summary
-
 ## 0. Preparation
 ### Step 1: Register FAISS Index (29 Query Pairs)
 
